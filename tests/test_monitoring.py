@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime
 from queue import Queue
 from threading import Event, Thread
@@ -47,6 +48,38 @@ class MonitoringTests(unittest.TestCase):
         self.assertEqual(service.notify.call_count, 2)
         self.assertIn("2026-09-29T12:00:00+08:00", service.notify.call_args.args[0])
 
+    def test_batch_failure_preserves_old_and_new_changes_until_retry_succeeds(self):
+        days = ["20991106", "20991105"]
+        old = calendar({"20991106": 650}, days=days)
+        new = replace(calendar({"20991105": 630}, days=days),
+                      observed_at="2026-09-29T12:10:00+08:00")
+        failure = NotificationResult(False, "offline")
+        notify = Mock(side_effect=[failure, failure, NotificationResult(True)])
+        service = MonitorService(config(dateToGo=days), clock=clock, notify=notify,
+                                 fetch=Mock(side_effect=[old, new, calendar({}, days=days)]))
+        stop = Event()
+        service.check_once(stop)
+
+        result = service.check_once(stop)
+        self.assertEqual(notify.call_count, 2)
+        self.assertEqual(len(result.notifications), 1)
+        attempt = result.notifications[0]
+        self.assertEqual(attempt.outcome, failure)
+        self.assertEqual(attempt.message.split("\n\n"), [
+            f"首次提醒: KMG → TNA，出发 2099-11-05，含税日历价 CNY 630\n报价采集时间: {new.observed_at}",
+            f"首次提醒: KMG → TNA，出发 2099-11-06，含税日历价 CNY 650\n报价采集时间: {old.observed_at}",
+        ])
+        self.assertEqual(set(service.tracker.pending), set(days))
+        self.assertFalse(service.tracker.baselines)
+
+        result = service.check_once(stop)
+        self.assertEqual(notify.call_count, 3)
+        self.assertEqual(len(result.notifications), 1)
+        self.assertTrue(result.notifications[0].outcome.success)
+        self.assertEqual(result.notifications[0].message, attempt.message)
+        self.assertEqual(service.tracker.baselines, {"20991105": 630, "20991106": 650})
+        self.assertFalse(service.tracker.pending)
+
     def test_rebound_cancels_pending_drop_instead_of_sending_stale_price(self):
         service = self.service(fetch=Mock(side_effect=[calendar(), calendar({"20991105": 580}),
                                                       calendar({"20991105": 620})]),
@@ -67,11 +100,14 @@ class MonitoringTests(unittest.TestCase):
         self.assertIn("630 → CNY 580", service.notify.call_args.args[0])
 
     def test_no_token_records_prices_without_pending_notifications(self):
-        service = MonitorService(config(SCKEY=""), fetch=Mock(return_value=calendar()),
+        prices = {"20991105": 630, "20991106": 650}
+        service = MonitorService(config(dateToGo=list(prices), SCKEY=""),
+                                 fetch=Mock(return_value=calendar(prices)),
                                  notify=Mock(), clock=clock)
-        service.check_once(Event())
+        result = service.check_once(Event())
         service.notify.assert_not_called()
-        self.assertEqual(service.tracker.baselines["20991105"], 630)
+        self.assertFalse(result.notifications)
+        self.assertEqual(service.tracker.baselines, prices)
         self.assertFalse(service.tracker.pending)
 
     def test_midnight_expires_only_old_dates_and_finishes_when_all_expired(self):
@@ -101,7 +137,7 @@ class MonitoringTests(unittest.TestCase):
             service.check_once(stop)
         service.notify.assert_not_called()
 
-    def test_stop_during_first_notification_prevents_second(self):
+    def test_stop_during_notification_records_and_acknowledges_batch(self):
         stop = Event()
 
         def notify(*args):
@@ -111,10 +147,18 @@ class MonitoringTests(unittest.TestCase):
         service = MonitorService(config(dateToGo=["20991105", "20991106"]), clock=clock,
                                  fetch=Mock(return_value=calendar({"20991105": 630, "20991106": 650})),
                                  notify=Mock(side_effect=notify))
-        with self.assertRaises(MonitorCancelled):
-            service.check_once(stop)
+        events = []
+        self.assertEqual(run_monitor(service, stop, events.append), 0)
         self.assertEqual(service.notify.call_count, 1)
-        self.assertEqual(service.tracker.baselines, {"20991105": 630})
+        result, = [event.data for event in events if event.kind == "result"]
+        attempt, = result.notifications
+        self.assertTrue(attempt.outcome.success)
+        self.assertEqual(attempt.message, service.notify.call_args.args[0])
+        self.assertTrue(any(event.kind == "log" and event.data.startswith("通知已发送")
+                            for event in events))
+        self.assertFalse(any(event.kind == "waiting" for event in events))
+        self.assertEqual(service.tracker.baselines, {"20991105": 630, "20991106": 650})
+        self.assertFalse(service.tracker.pending)
 
     def test_retryable_errors_retry_and_wait_is_interruptible(self):
         for error, delay in (

@@ -118,17 +118,19 @@ class MonitorService:
         for day in active:
             self.tracker.observe(day, calendar.prices.get(day), calendar.observed_at)
         # 缺失报价不清除待发送消息；其中保留原始采集时间。
-        for change in list(self.tracker.pending.values()):
-            if stop_event.is_set():
-                raise MonitorCancelled()
-            if not config["SCKEY"]:
-                self.tracker.acknowledge(change)
-                continue
-            message = format_notification(change, config)
+        changes = sorted(self.tracker.pending.values(), key=lambda change: change.day)
+        if not changes:
+            return result
+        if stop_event.is_set():
+            raise MonitorCancelled()
+        if config["SCKEY"]:
+            message = "\n\n".join(format_notification(change, config) for change in changes)
             outcome = self.notify(message, config["SCKEY"])
             result.notifications.append(NotificationAttempt(message, outcome))
-            if outcome.success:
-                self.tracker.acknowledge(change)
+            if not outcome.success:
+                return result
+        for change in changes:
+            self.tracker.acknowledge(change)
         return result
 
 
