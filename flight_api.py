@@ -1,8 +1,10 @@
 """携程 15380 日历请求与含税报价解析。"""
 
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import math
 import re
 from typing import Dict, Optional
@@ -24,6 +26,12 @@ class FlightAPIError(Exception):
 
 class RetryableFlightError(FlightAPIError):
     """服务器限流或临时不可用，可以稍后重试。"""
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None,
+                 retry_after: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
 
 
 class MonitorCancelled(Exception):
@@ -110,6 +118,29 @@ class CalendarResult:
     price_kind: str = "tax_inclusive"
 
 
+def _parse_retry_after(headers, clock) -> Optional[int]:
+    if not isinstance(headers, Mapping):
+        return None
+    value = next((value for name, value in headers.items()
+                  if isinstance(name, str) and name.lower() == "retry-after"), None)
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    try:
+        if re.fullmatch(r"[0-9]+", value):
+            return int(value) or None
+        retry_at = parsedate_to_datetime(value)
+    except (ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    now = clock()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    seconds = (retry_at - now).total_seconds()
+    return math.ceil(seconds) if seconds > 0 else None
+
+
 def fetch_flight_prices(config: dict, stop_event=None, *, post=None, clock=None) -> CalendarResult:
     # 日期的动态过期由监控服务处理，避免一次查询跨午夜时被重复校验拒绝。
     config = normalize_config(config, allow_expired=True)
@@ -124,8 +155,13 @@ def fetch_flight_prices(config: dict, stop_event=None, *, post=None, clock=None)
                         headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if stop_event is not None and stop_event.is_set():
             raise MonitorCancelled("查询已停止")
-        if response.status_code == 429 or 500 <= response.status_code < 600:
-            raise RetryableFlightError(f"携程暂时不可用（HTTP {response.status_code}）")
+        if response.status_code == 429:
+            retry_after = _parse_retry_after(getattr(response, "headers", None), clock)
+            raise RetryableFlightError(f"携程暂时不可用（HTTP {response.status_code}）",
+                                       status_code=429, retry_after=retry_after)
+        if 500 <= response.status_code < 600:
+            raise RetryableFlightError(f"携程暂时不可用（HTTP {response.status_code}）",
+                                       status_code=response.status_code)
         if response.status_code != 200:
             raise FlightAPIError(f"携程日历请求失败（HTTP {response.status_code}）")
         try:

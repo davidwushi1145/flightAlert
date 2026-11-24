@@ -67,6 +67,28 @@ class FlightAPITests(unittest.TestCase):
                 fetch_flight_prices(config(), post=Mock(return_value=response(status=status)))
             self.assertNotIsInstance(caught.exception, RetryableFlightError)
 
+    def test_retry_after_is_parsed_only_for_rate_limiting(self):
+        for status, headers, expected in (
+            (429, {"retry-after": " 45 "}, 45),
+            (429, {"Retry-After": "Tue, 29 Sep 2026 04:01:00 GMT"}, 60),
+            (429, {"Retry-After": "Tue, 29 Sep 2026 04:01:00"}, 60),
+            (429, {}, None),
+            (429, [], None),
+            (429, {"Retry-After": "0"}, None),
+            (429, {"Retry-After": "-1"}, None),
+            (429, {"Retry-After": "1.5"}, None),
+            (429, {"Retry-After": "Tue, 29 Sep 2026 03:59:00 GMT"}, None),
+            (429, {"Retry-After": "invalid"}, None),
+            (503, {"Retry-After": "45"}, None),
+        ):
+            with self.subTest(status=status, headers=headers):
+                reply = response(status=status, headers=headers)
+                with self.assertRaises(RetryableFlightError) as caught:
+                    fetch_flight_prices(config(), post=Mock(return_value=reply),
+                                        clock=lambda: clock().replace(microsecond=500000))
+                self.assertEqual(caught.exception.status_code, status)
+                self.assertEqual(caught.exception.retry_after, expected)
+
     def test_non_json_response_is_explicit_error(self):
         reply = response()
         reply.json.side_effect = ValueError("HTML")

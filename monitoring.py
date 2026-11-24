@@ -118,17 +118,19 @@ class MonitorService:
         for day in active:
             self.tracker.observe(day, calendar.prices.get(day), calendar.observed_at)
         # 缺失报价不清除待发送消息；其中保留原始采集时间。
-        for change in list(self.tracker.pending.values()):
-            if stop_event.is_set():
-                raise MonitorCancelled()
-            if not config["SCKEY"]:
-                self.tracker.acknowledge(change)
-                continue
-            message = format_notification(change, config)
+        changes = sorted(self.tracker.pending.values(), key=lambda change: change.day)
+        if not changes:
+            return result
+        if stop_event.is_set():
+            raise MonitorCancelled()
+        if config["SCKEY"]:
+            message = "\n\n".join(format_notification(change, config) for change in changes)
             outcome = self.notify(message, config["SCKEY"])
             result.notifications.append(NotificationAttempt(message, outcome))
-            if outcome.success:
-                self.tracker.acknowledge(change)
+            if not outcome.success:
+                return result
+        for change in changes:
+            self.tracker.acknowledge(change)
         return result
 
 
@@ -179,11 +181,17 @@ def run_monitor(service: MonitorService, stop_event, emit, *, once=False) -> int
             except MonitorCancelled:
                 return 0
             except (requests.Timeout, requests.ConnectionError, RetryableFlightError) as exc:
-                report("error", f"查询暂时失败: {exc}；{RETRY_DELAY} 秒后重试")
                 if once:
+                    report("error", f"查询暂时失败: {exc}")
                     finish_message = "本轮查询失败"
                     return 1
-                delay, retrying = RETRY_DELAY, True
+                delay = RETRY_DELAY
+                if isinstance(exc, RetryableFlightError) and exc.status_code == 429:
+                    delay = service.config["sleepTime"]
+                    if exc.retry_after is not None and exc.retry_after > 0:
+                        delay = exc.retry_after
+                report("error", f"查询暂时失败: {exc}；{delay} 秒后重试")
+                retrying = True
             deadline = time.monotonic() + delay
             while not stop_event.is_set():
                 remaining = deadline - time.monotonic()

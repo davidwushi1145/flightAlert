@@ -25,5 +25,6 @@ def clock():
     return datetime(2026, 9, 29, 12, tzinfo=CHINA)
 
 
-def response(data=None, status=200):
-    return Mock(status_code=status, json=Mock(return_value=data))
+def response(data=None, status=200, headers=None):
+    return Mock(status_code=status, json=Mock(return_value=data),
+                headers={} if headers is None else headers)
