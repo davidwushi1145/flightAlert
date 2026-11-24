@@ -2,7 +2,7 @@ from datetime import datetime
 from queue import Queue
 from threading import Event, Thread
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -117,8 +117,16 @@ class MonitoringTests(unittest.TestCase):
         self.assertEqual(service.tracker.baselines, {"20991105": 630})
 
     def test_retryable_errors_retry_and_wait_is_interruptible(self):
-        for error in (requests.Timeout("timeout"), requests.ConnectionError("offline"),
-                      RetryableFlightError("HTTP 503")):
+        for error, delay in (
+            (requests.Timeout("timeout"), 30),
+            (requests.ConnectionError("offline"), 30),
+            (RetryableFlightError("HTTP 503", status_code=503), 30),
+            (RetryableFlightError("temporary error"), 30),
+            (RetryableFlightError("HTTP 429", status_code=429, retry_after=75), 75),
+            (RetryableFlightError("HTTP 429", status_code=429), config()["sleepTime"]),
+            (RetryableFlightError("HTTP 429", status_code=429, retry_after=0),
+             config()["sleepTime"]),
+        ):
             with self.subTest(error=error):
                 service = self.service(fetch=Mock(side_effect=error))
                 stop = Event()
@@ -129,10 +137,27 @@ class MonitoringTests(unittest.TestCase):
                     if event.kind == "waiting":
                         stop.set()
 
-                self.assertEqual(run_monitor(service, stop, emit), 0)
+                with patch("monitoring.time.monotonic", return_value=0):
+                    self.assertEqual(run_monitor(service, stop, emit), 0)
                 self.assertEqual(service.fetch.call_count, 1)
-                self.assertTrue(any(e.kind == "waiting" and e.data[1] for e in events))
+                self.assertEqual([e.data for e in events if e.kind == "waiting"], [(delay, True)])
+                self.assertEqual([e.data for e in events if e.kind == "error"],
+                                 [f"查询暂时失败: {error}；{delay} 秒后重试"])
                 self.assertEqual(events[-1].kind, "finished")
+
+    def test_once_reports_retryable_error_without_waiting(self):
+        for error in (requests.Timeout("timeout"), requests.ConnectionError("offline"),
+                      RetryableFlightError("HTTP 503", status_code=503),
+                      RetryableFlightError("HTTP 429", status_code=429, retry_after=75)):
+            with self.subTest(error=error):
+                service = self.service(fetch=Mock(side_effect=error))
+                events = []
+                self.assertEqual(run_monitor(service, Event(), events.append, once=True), 1)
+                self.assertEqual(service.fetch.call_count, 1)
+                self.assertFalse(any(e.kind == "waiting" for e in events))
+                self.assertEqual([e.data for e in events if e.kind == "error"],
+                                 [f"查询暂时失败: {error}"])
+                self.assertEqual((events[-1].kind, events[-1].data), ("finished", "本轮查询失败"))
 
     def test_business_format_and_programming_errors_stop_without_retry(self):
         for error in (FlightAPIError("invalid priceList"), ValueError("bad config"), KeyError("bug")):

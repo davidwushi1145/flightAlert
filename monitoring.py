@@ -179,11 +179,17 @@ def run_monitor(service: MonitorService, stop_event, emit, *, once=False) -> int
             except MonitorCancelled:
                 return 0
             except (requests.Timeout, requests.ConnectionError, RetryableFlightError) as exc:
-                report("error", f"查询暂时失败: {exc}；{RETRY_DELAY} 秒后重试")
                 if once:
+                    report("error", f"查询暂时失败: {exc}")
                     finish_message = "本轮查询失败"
                     return 1
-                delay, retrying = RETRY_DELAY, True
+                delay = RETRY_DELAY
+                if isinstance(exc, RetryableFlightError) and exc.status_code == 429:
+                    delay = service.config["sleepTime"]
+                    if exc.retry_after is not None and exc.retry_after > 0:
+                        delay = exc.retry_after
+                report("error", f"查询暂时失败: {exc}；{delay} 秒后重试")
+                retrying = True
             deadline = time.monotonic() + delay
             while not stop_event.is_set():
                 remaining = deadline - time.monotonic()
